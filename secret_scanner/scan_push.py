@@ -1,24 +1,27 @@
 """
 GitHub Actions push-time secret scanner.
 
-This scanner checks ONLY the content introduced by the current push.
+This scanner checks ONLY content introduced by the current push.
 
 Behavior:
-    1. GitHub Actions provides:
-         - GITHUB_EVENT_BEFORE = previous commit
-         - GITHUB_SHA          = current commit
-    2. We calculate the diff between those commits.
-    3. Only added lines from changed files are scanned.
-    4. Deleted/unchanged lines are ignored.
-    5. If a secret is found, the GitHub Actions job exits with code 1.
+    1. GitHub Actions provides the current commit through GITHUB_SHA.
+    2. The push event JSON provides the previous commit through
+       GITHUB_EVENT_PATH -> "before".
+    3. The scanner calculates the Git diff between those commits.
+    4. ONLY added lines are scanned.
+    5. Deleted and unchanged lines are ignored.
+    6. If a secret is detected, the job exits with code 1.
+    7. Every finding includes a direct GitHub URL to the exact file/line
+       in the exact commit that triggered the finding.
 
 Important:
-    This is still a POST-PUSH CI check. It does not prevent the original
+    This is a POST-PUSH CI check. It does not prevent the original
     `git push` from being accepted by GitHub.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -31,6 +34,10 @@ from detectors import Finding, is_scannable, scan_text  # noqa: E402
 
 REPO_ROOT = os.getcwd()
 
+# GitHub Actions automatically provides this as:
+#   OWNER/REPOSITORY
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+
 
 def _run_git_command(args: list[str]) -> str:
     """Run a git command and return stdout."""
@@ -41,18 +48,24 @@ def _run_git_command(args: list[str]) -> str:
         text=True,
         check=True,
     )
+
     return result.stdout
 
 
 def _get_commit_range() -> tuple[str, str]:
     """
-    Get the before/after commits for the current GitHub push.
+    Get the before/after commit SHAs for the current GitHub push.
 
-    GitHub provides the push event payload through GITHUB_EVENT_PATH.
-    The payload contains:
-        before = commit before the push
-        after  = commit after the push
+    Current commit:
+        GITHUB_SHA
+
+    Previous commit:
+        GITHUB_EVENT_PATH -> event["before"]
+
+    For an initial push, GitHub may provide an all-zero "before" SHA.
+    In that case we use Git's empty-tree SHA.
     """
+
     after = os.environ.get("GITHUB_SHA", "").strip()
 
     if not after:
@@ -67,8 +80,6 @@ def _get_commit_range() -> tuple[str, str]:
 
     if event_path:
         try:
-            import json
-
             with open(event_path, "r", encoding="utf-8") as fh:
                 event = json.load(fh)
 
@@ -77,20 +88,60 @@ def _get_commit_range() -> tuple[str, str]:
         except (OSError, json.JSONDecodeError):
             before = ""
 
-    # First push / special event
+    # Initial push / branch creation.
+    #
+    # Git's empty tree object lets us diff:
+    #
+    #     empty tree -> first commit
+    #
+    # which means all files introduced by the first push are scanned.
     if not before or before == "0" * 40:
         before = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
     return before, after
 
 
+def _ensure_commit_available(commit_sha: str) -> None:
+    """
+    Ensure the requested commit exists in the local checkout.
+
+    This normally works when actions/checkout uses:
+
+        fetch-depth: 0
+    """
+    result = subprocess.run(
+        [
+            "git",
+            "cat-file",
+            "-e",
+            f"{commit_sha}^{{commit}}",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Commit {commit_sha} is not available in the GitHub Actions "
+            "checkout. Make sure actions/checkout uses fetch-depth: 0."
+        )
+
+
 def _get_changed_files(before: str, after: str) -> list[str]:
     """
-    Return files changed by this push.
+    Return files changed by the current push.
 
-    Deleted files are included by git diff, but they will be skipped later
-    because we only scan content that exists in the new commit.
+    We scan:
+        A = Added
+        C = Copied
+        M = Modified
+        R = Renamed
+
+    Deleted files are excluded because there is no current file content
+    to scan.
     """
+
     output = _run_git_command(
         [
             "git",
@@ -115,16 +166,21 @@ def _get_added_lines(
     rel_path: str,
 ) -> str:
     """
-    Return only added lines from a file's diff.
+    Return ONLY the lines added by this push.
 
     Example:
-        - old password = "..."
-        + api_key = "..."
 
-    Only:
-        + api_key = "..."
-    is returned for scanning.
+        - password = "old-value"
+        + api_key = "new-value"
+
+    Only the following is returned:
+
+        api_key = "new-value"
+
+    This prevents old, unchanged secrets from being reported repeatedly
+    on unrelated later pushes.
     """
+
     output = _run_git_command(
         [
             "git",
@@ -141,23 +197,52 @@ def _get_added_lines(
     added_lines: list[str] = []
 
     for line in output.splitlines():
-        # Ignore file headers and hunk metadata.
+
+        # Git diff file header
         if line.startswith("+++"):
             continue
 
+        # Hunk metadata
         if line.startswith("@@"):
             continue
 
-        # Only scan additions.
+        # Only added lines
         if line.startswith("+"):
             added_lines.append(line[1:])
 
     return "\n".join(added_lines)
 
 
+def _github_file_url(
+    commit_sha: str,
+    rel_path: str,
+    line_number: int,
+) -> str:
+    """
+    Build a direct GitHub URL to the exact file and line in the
+    exact commit that was scanned.
+    """
+
+    if not GITHUB_REPOSITORY:
+        return ""
+
+    return (
+        f"https://github.com/{GITHUB_REPOSITORY}"
+        f"/blob/{commit_sha}/{rel_path}"
+        f"#L{line_number}"
+    )
+
+
 def main() -> int:
+    # ---------------------------------------------------------------
+    # 1. Determine the push commit range
+    # ---------------------------------------------------------------
     try:
         before, after = _get_commit_range()
+
+        # Make sure the previous commit exists locally.
+        _ensure_commit_available(before)
+
     except RuntimeError as exc:
         print(f"Scanner configuration error: {exc}")
         return 2
@@ -166,37 +251,49 @@ def main() -> int:
     print(f"Before commit: {before}")
     print(f"After commit:  {after}")
 
+    # ---------------------------------------------------------------
+    # 2. Find files changed by this push
+    # ---------------------------------------------------------------
     try:
         changed_files = _get_changed_files(before, after)
+
     except subprocess.CalledProcessError as exc:
         print("Failed to determine changed files.")
-        print(exc.stderr or exc.stdout)
+
+        if exc.stderr:
+            print(exc.stderr)
+
         return 2
 
     if not changed_files:
         print("No changed files found.")
-        print("No secrets detected.")
+        print("No secrets detected in this push.")
         return 0
 
     print(f"Changed files: {len(changed_files)}")
 
-    all_findings: list[tuple[str, Finding]] = []
+    # ---------------------------------------------------------------
+    # 3. Scan only newly-added content
+    # ---------------------------------------------------------------
+    all_findings: list[Finding] = []
 
     for rel_path in changed_files:
         try:
-            # Get the file size from the current checkout.
-            # Deleted files are excluded by --diff-filter above.
             abs_path = Path(REPO_ROOT) / rel_path
 
+            # File may have disappeared from the working tree even though
+            # Git reported it as changed.
             if not abs_path.is_file():
                 continue
 
             size = abs_path.stat().st_size
 
+            # Reuse existing scanner file filters.
             if not is_scannable(rel_path, size):
                 continue
 
-            # Scan only content introduced by this push.
+            # IMPORTANT:
+            # Scan only content added by this push.
             added_content = _get_added_lines(
                 before,
                 after,
@@ -206,26 +303,40 @@ def main() -> int:
             if not added_content:
                 continue
 
-            findings = scan_text(rel_path, added_content)
+            findings = scan_text(
+                rel_path,
+                added_content,
+            )
 
-            for finding in findings:
-                all_findings.append((rel_path, finding))
+            all_findings.extend(findings)
 
-        except (OSError, UnicodeError):
-            # Ignore files that cannot safely be inspected.
+        except (OSError, UnicodeError) as exc:
+            print(
+                f"Warning: could not inspect {rel_path}: {exc}"
+            )
             continue
+
         except subprocess.CalledProcessError as exc:
             print(f"Warning: could not diff {rel_path}")
-            print(exc.stderr or exc.stdout)
+
+            if exc.stderr:
+                print(exc.stderr)
+
             continue
 
+    # ---------------------------------------------------------------
+    # 4. No findings
+    # ---------------------------------------------------------------
     if not all_findings:
         print("\nNo secrets detected in this push.")
         return 0
 
+    # ---------------------------------------------------------------
+    # 5. Findings
+    # ---------------------------------------------------------------
     high_count = sum(
         1
-        for _, finding in all_findings
+        for finding in all_findings
         if finding.severity == "high"
     )
 
@@ -234,14 +345,34 @@ def main() -> int:
         f"{high_count} high severity ***\n"
     )
 
-    for _, finding in all_findings:
+    for finding in all_findings:
+
         print(
             f"[{finding.severity.upper()}] "
             f"{finding.detector} - "
             f"{finding.file_path}:{finding.line_number}"
         )
-        print(f"    {finding.line_preview}")
 
+        # Detector already returns a redacted preview.
+        print(
+            f"    {finding.line_preview}"
+        )
+
+        # Direct link to exact commit/file/line.
+        github_url = _github_file_url(
+            after,
+            finding.file_path,
+            finding.line_number,
+        )
+
+        if github_url:
+            print(
+                f"    View in GitHub: {github_url}"
+            )
+
+        print()
+
+    # Non-zero exit causes GitHub Actions to mark the job as failed.
     return 1
 
 
