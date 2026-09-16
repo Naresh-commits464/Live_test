@@ -48,11 +48,11 @@ def _get_commit_range() -> tuple[str, str]:
     """
     Get the before/after commits for the current GitHub push.
 
-    GitHub Actions sets:
-        GITHUB_EVENT_BEFORE = commit before the push
-        GITHUB_SHA          = commit after the push
+    GitHub provides the push event payload through GITHUB_EVENT_PATH.
+    The payload contains:
+        before = commit before the push
+        after  = commit after the push
     """
-    before = os.environ.get("GITHUB_EVENT_BEFORE", "").strip()
     after = os.environ.get("GITHUB_SHA", "").strip()
 
     if not after:
@@ -61,9 +61,23 @@ def _get_commit_range() -> tuple[str, str]:
             "This scanner must run inside GitHub Actions."
         )
 
-    # First push / special events may not have a usable "before" commit.
-    # In that case, compare against the empty Git tree so that files
-    # introduced by the initial commit are scanned.
+    event_path = os.environ.get("GITHUB_EVENT_PATH", "").strip()
+
+    before = ""
+
+    if event_path:
+        try:
+            import json
+
+            with open(event_path, "r", encoding="utf-8") as fh:
+                event = json.load(fh)
+
+            before = str(event.get("before", "")).strip()
+
+        except (OSError, json.JSONDecodeError):
+            before = ""
+
+    # First push / special event
     if not before or before == "0" * 40:
         before = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
