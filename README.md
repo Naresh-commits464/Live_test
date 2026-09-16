@@ -1,9 +1,4 @@
-# Customer Orders Service
+# Cleanup
 
-Small demonstration service used for scanner testing.
-
-Goals:
-- accept an order
-- validate input
-- calculate totals
-- return a JSON response
+Credential-looking test values are removed from the working tree.
+This stage is intentionally clean so the history can be tested separately.
