@@ -1,4 +1,3 @@
-```python
 """
 GitHub Actions push-time secret scanner.
 
