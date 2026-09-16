@@ -1,0 +1,6 @@
+{
+  "service": "customer-orders",
+  "environment": "development",
+  "port": 8080,
+  "log_level": "INFO"
+}
